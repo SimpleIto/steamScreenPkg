@@ -1,7 +1,8 @@
 package org.simpleito;
 
-import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
+import java.io.BufferedReader;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import java.io.*;
 import java.net.URI;
@@ -18,9 +19,10 @@ import java.util.concurrent.*;
 public class SteamScreenshotOrganizer {
     private static final String APP_JSON_PATH = "app.json";
     private static final String STEAM_API_URL = "https://api.steampowered.com/ISteamApps/GetAppList/v2/";
-    private static final ObjectMapper objectMapper = new ObjectMapper();
+    private static final Pattern APP_PATTERN = Pattern.compile("\\{\"appid\":(\\d+),\"name\":\"([^\"]*)\"}");
     private static final Scanner scanner = new Scanner(System.in);
     private static final double BYTES_PER_MB = 1024 * 1024;
+    static int unknownSec = 1;
 
     public static void main(String[] args) {
         try {
@@ -93,13 +95,16 @@ public class SteamScreenshotOrganizer {
 
             System.out.printf("app.json download completed. Total size: %.2f MB%n", totalBytesRead / BYTES_PER_MB);
 
-            // 验证下载的数据是否是有效的JSON
-            try (FileReader reader = new FileReader(APP_JSON_PATH)) {
-                objectMapper.readTree(reader);
+            // 简单验证文件是否包含预期的JSON结构
+            try (BufferedReader reader = new BufferedReader(new FileReader(APP_JSON_PATH))) {
+                String firstLine = reader.readLine();
+                if (!firstLine.contains("{\"applist\":{\"apps\":[")) {
+                    Files.deleteIfExists(Path.of(APP_JSON_PATH));
+                    throw new IOException("Downloaded data does not have the expected JSON structure");
+                }
             } catch (Exception e) {
-                // 如果不是有效的JSON，删除文件并抛出异常
                 Files.deleteIfExists(Path.of(APP_JSON_PATH));
-                throw new IOException("Downloaded data is not valid JSON", e);
+                throw new IOException("Failed to validate downloaded JSON", e);
             }
         } catch (Exception e) {
             // 如果下载过程中出错，确保删除可能不完整的文件
@@ -113,34 +118,37 @@ public class SteamScreenshotOrganizer {
             throw new IOException("Cannot read app.json file");
         }
 
-        JsonNode root = objectMapper.readTree(appJsonFile);
-        JsonNode apps = root.path("applist").path("apps");
-
-        if (!apps.isArray()) {
-            throw new IOException("Invalid app.json format: 'apps' is not an array");
-        }
         Map<String, String> appIdToName = new HashMap<>();
-
-        for (JsonNode app : apps) {
-            if (!app.has("appid") || !app.has("name")) {
-                continue; // Skip invalid entries
+        
+        try (BufferedReader reader = new BufferedReader(new FileReader(appJsonFile))) {
+            String line;
+            StringBuilder content = new StringBuilder();
+            while ((line = reader.readLine()) != null) {
+                content.append(line);
             }
-
-            String appId = app.path("appid").asText();
-            String name = app.path("name").asText().trim();
-
-            // Only add valid entries
-            if (isValidAppId(appId) && !name.isEmpty()) {
-                // Sanitize game name for use as directory name
-                name = sanitizeDirectoryName(name);
-                appIdToName.put(appId, name);
+            
+            Matcher matcher = APP_PATTERN.matcher(content);
+            while (matcher.find()) {
+                String appId = matcher.group(1);
+                String name = matcher.group(2).trim();
+                
+                // Only add valid entries
+                if (isValidAppId(appId) && !name.isEmpty()) {
+                    // Sanitize game name for use as directory name
+                    name = sanitizeDirectoryName(name);
+                    appIdToName.put(appId, name);
+                }
             }
+        }
+
+        if (appIdToName.isEmpty()) {
+            throw new IOException("No valid app entries found in app.json");
         }
 
         return appIdToName;
     }
 
-    static int unknownSec = 1;
+
 
     private static String sanitizeDirectoryName(String name) {
         // Remove or replace invalid characters for directory names
@@ -175,24 +183,16 @@ public class SteamScreenshotOrganizer {
 
     private static void organizeScreenshots(Map<String, String> appIdToName, int folderType) throws IOException {
         Path currentDir = Paths.get(".");
-        ExecutorService executor = ForkJoinPool.commonPool();
+        ForkJoinPool executor = ForkJoinPool.commonPool();
 
-        try {
-            if (folderType == 1) {
-                organizeTypeOne(currentDir, appIdToName, executor);
-            } else {
-                organizeTypeTwo(currentDir, appIdToName, executor);
-            }
+        if (folderType == 1) {
+            organizeTypeOne(currentDir, appIdToName, executor);
+        } else {
+            organizeTypeTwo(currentDir, appIdToName, executor);
+        }
 
-            executor.shutdown();
-            if (!executor.awaitTermination(10, TimeUnit.MINUTES)) {
-                System.out.println("Warning: Some file processing timed out");
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IOException("File processing was interrupted", e);
-        } finally {
-            executor.shutdownNow();
+        if (!executor.awaitQuiescence(20, TimeUnit.MINUTES)) {
+            System.out.println("timeout: not all tasks completed within 20 minutes");
         }
     }
 
@@ -210,15 +210,14 @@ public class SteamScreenshotOrganizer {
     }
 
     private static void organizeTypeOne(Path currentDir, Map<String, String> appIdToName, ExecutorService executor) throws IOException {
-        // Create a filter for image files
-        DirectoryStream.Filter<Path> filter = file -> {
+        DirectoryStream.Filter<Path> screenFileFilter = file -> {
             String fileName = file.getFileName().toString();
             // Only process regular files that are images and match Steam screenshot pattern
             return Files.isRegularFile(file) &&
                     isValidSteamScreenshotName(fileName);
         };
 
-        try (DirectoryStream<Path> stream = Files.newDirectoryStream(currentDir, filter)) {
+        try (DirectoryStream<Path> stream = Files.newDirectoryStream(currentDir, screenFileFilter)) {
             for (Path file : stream) {
                 CompletableFuture.runAsync(() -> {
                     try {
@@ -231,7 +230,7 @@ public class SteamScreenshotOrganizer {
                             String gameName = defaultIfBlank(appIdToName.get(appId), appId);
                             Path targetDir = currentDir.resolve(gameName);
 
-                            moveFile(file, targetDir, fileName);
+                            moveFile(file, targetDir, fileName, true);
                         } else {
                             System.err.println("Skipped file with invalid appId: " + fileName);
                         }
@@ -267,9 +266,9 @@ public class SteamScreenshotOrganizer {
                             String gameName = defaultIfBlank(appIdToName.get(dirName), dirName);
 
                             Path targetDir = pkgDir.resolve(gameName);
-                            try (DirectoryStream<Path> screenshots = Files.newDirectoryStream(screenshotsDir)) {
+                            try (DirectoryStream<Path> screenshots = Files.newDirectoryStream(screenshotsDir, Files::isRegularFile)) {
                                 for (Path screenshot : screenshots) {
-                                    moveFile(screenshot, targetDir, screenshot.getFileName().toString());
+                                    moveFile(screenshot, targetDir, screenshot.getFileName().toString(), false);
                                 }
                             }
                         }
@@ -281,7 +280,7 @@ public class SteamScreenshotOrganizer {
         }
     }
 
-    private static void moveFile(Path source, Path targetDir, String fileName) throws IOException {
+    private static void moveFile(Path source, Path targetDir, String fileName, boolean move) throws IOException {
         try {
             // Create target directory if it doesn't exist
             Files.createDirectories(targetDir);
@@ -292,7 +291,11 @@ public class SteamScreenshotOrganizer {
             }
 
             // Move the file
-            Files.move(source, targetDir.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
+            if (move) {
+                Files.move(source, targetDir.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
+            } else {
+                Files.copy(source, targetDir.resolve(fileName), StandardCopyOption.REPLACE_EXISTING);
+            }
             System.out.printf("Moved: %s -> %s%n", fileName, targetDir.getFileName());
         } catch (IOException e) {
             throw new IOException("Failed to move file: " + source + " -> " + targetDir, e);
